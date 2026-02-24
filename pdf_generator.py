@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union, BinaryIO
-import textwrap
 import re
 
 from reportlab.lib import colors
@@ -36,6 +35,7 @@ class FlyerData:
     color_borde_caracteristicas: str
     descripcion: str
     color_descripcion: str
+    descripcion_tamano: float
     precio: str
     color_precio: str
     energia: str
@@ -266,12 +266,153 @@ def generate_pdf(data: FlyerData, output_path: Union[str, BinaryIO]) -> None:
     texto3 = _format_superscripts(data.texto3 or "TEXTO 3")
     c.drawRightString(PAGE_W - 12 * mm, sub_y, texto3)
 
+    top_area_bottom_y = PAGE_H - header_h - sub_h
+
+    footer_top = 18 * mm
+    footer_max_h = 18 * mm
+    price_y = footer_top - 2 * mm
+
+    energy_x = 10 * mm
+    energy_img_w = 30 * mm
+    energy_img_h = 30 * mm
+    energy_img_y = price_y + 10 * mm
+
+    min_margin = 3 * mm
+    bottom_area_top_y = energy_img_y + energy_img_h + 2 * mm
+    available_height = top_area_bottom_y - bottom_area_top_y
+
+    min_block_scale = 0.90
+    max_block_scale = 1.08
+    scale_step = 0.01
+    desc_font_min = 8.0
+
+    desc_font_size = _safe_description_font_size(data.descripcion_tamano)
+    if len(data.descripcion or "") > 1000:
+        desc_font_size = max(desc_font_min, desc_font_size - 1.0)
+
+    def compute_layout(scale: float, spacing_ratio: float, font_size: float) -> dict:
+        top_gap = 6 * mm * spacing_ratio
+        grid_h = 110 * mm * scale
+        grid_w = PAGE_W - 20 * mm
+        grid_gap = 4 * mm
+        icon_row_h = 14 * mm * scale
+        grid_to_icons_gap = 12 * mm * spacing_ratio
+        icons_to_desc_gap = 10 * mm * spacing_ratio
+        qr_size = 30 * mm * scale
+        desc_x = 10 * mm + qr_size + 6 * mm
+        desc_w = PAGE_W - desc_x - 10 * mm
+        line_h = max(3.2 * mm, font_size * 1.3)
+        desc_lines = _wrap_text_to_width(c, data.descripcion or "", "Helvetica", font_size, desc_w)
+        desc_h = len(desc_lines) * line_h
+        desc_row_h = max(qr_size, desc_h + 2 * mm)
+        block_h = top_gap + grid_h + grid_to_icons_gap + icon_row_h + icons_to_desc_gap + desc_row_h
+        remaining = available_height - block_h
+        return {
+            "scale": scale,
+            "top_gap": top_gap,
+            "grid_h": grid_h,
+            "grid_w": grid_w,
+            "grid_gap": grid_gap,
+            "icon_row_h": icon_row_h,
+            "grid_to_icons_gap": grid_to_icons_gap,
+            "icons_to_desc_gap": icons_to_desc_gap,
+            "qr_size": qr_size,
+            "desc_x": desc_x,
+            "desc_w": desc_w,
+            "desc_font_size": font_size,
+            "line_h": line_h,
+            "desc_lines": desc_lines,
+            "desc_h": desc_h,
+            "desc_row_h": desc_row_h,
+            "block_h": block_h,
+            "remaining": remaining,
+        }
+
+    def scale_range(start: float, end: float, step: float) -> list[float]:
+        values = []
+        current = start
+        while current >= end - 1e-9:
+            values.append(round(current, 2))
+            current -= step
+        return values
+
+    base_layout = compute_layout(1.0, 1.0, desc_font_size)
+    prefer_scale_up = base_layout["remaining"] > 20 * mm
+    candidate_scales = scale_range(max_block_scale if prefer_scale_up else 1.0, min_block_scale, scale_step)
+
+    layout = None
+    for scale in candidate_scales:
+        candidate = compute_layout(scale, 1.0, desc_font_size)
+        if candidate["remaining"] >= 2 * min_margin:
+            layout = candidate
+            break
+
+    if layout is None:
+        for scale in scale_range(1.0, min_block_scale, scale_step):
+            candidate = compute_layout(scale, 0.88, desc_font_size)
+            if candidate["remaining"] >= 2 * min_margin:
+                layout = candidate
+                break
+
+    if layout is None:
+        font_size = desc_font_size
+        while font_size >= desc_font_min:
+            candidate = compute_layout(min_block_scale, 0.82, font_size)
+            if candidate["remaining"] >= 2 * min_margin:
+                layout = candidate
+                break
+            font_size -= 0.5
+
+    if layout is None:
+        layout = compute_layout(min_block_scale, 0.80, desc_font_min)
+        fixed_part_h = (
+            layout["top_gap"]
+            + layout["grid_h"]
+            + layout["grid_to_icons_gap"]
+            + layout["icon_row_h"]
+            + layout["icons_to_desc_gap"]
+        )
+        max_desc_row_h = max(layout["qr_size"], available_height - fixed_part_h - 2 * min_margin)
+        max_desc_h = max(0.0, max_desc_row_h - 2 * mm)
+        max_lines = max(1, int(max_desc_h // layout["line_h"]))
+        truncated = _truncate_lines_to_count(
+            c,
+            layout["desc_lines"],
+            max_lines,
+            "Helvetica",
+            layout["desc_font_size"],
+            layout["desc_w"],
+        )
+        used_desc_h = len(truncated) * layout["line_h"]
+        layout["desc_lines"] = truncated
+        layout["desc_h"] = used_desc_h
+        layout["desc_row_h"] = max(layout["qr_size"], used_desc_h + 2 * mm)
+        layout["block_h"] = fixed_part_h + layout["desc_row_h"]
+        layout["remaining"] = available_height - layout["block_h"]
+
+    remaining = max(0.0, layout["remaining"])
+    if remaining >= 2 * min_margin:
+        margin_top = remaining / 2
+    else:
+        margin_top = max(0.0, remaining / 2)
+
+    grid_top = top_area_bottom_y - margin_top - layout["top_gap"]
+    block_bottom_y = grid_top - (
+        layout["grid_h"]
+        + layout["grid_to_icons_gap"]
+        + layout["icon_row_h"]
+        + layout["icons_to_desc_gap"]
+        + layout["desc_row_h"]
+    )
+    min_bottom_limit = bottom_area_top_y + min_margin
+    if block_bottom_y < min_bottom_limit:
+        grid_top += min_bottom_limit - block_bottom_y
+
     # Image grid area
-    grid_top = PAGE_H - header_h - sub_h - 6 * mm
     grid_left = 10 * mm
-    grid_w = PAGE_W - 20 * mm
-    grid_h = 110 * mm
-    gap = 4 * mm
+    grid_w = layout["grid_w"]
+    grid_h = layout["grid_h"]
+    gap = layout["grid_gap"]
     cell_w = (grid_w - gap) / 2
     cell_h = (grid_h - gap) / 2
 
@@ -309,16 +450,16 @@ def generate_pdf(data: FlyerData, output_path: Union[str, BinaryIO]) -> None:
 
     # Rebajado band
     if data.rebajado:
-        band_h = 14 * mm
+        band_h = 14 * mm * layout["scale"]
         band_y = grid_top - grid_h / 2 - band_h / 2
         c.setFillColor(colors.Color(1, 0.7, 0.7, alpha=0.6))
         c.rect(0, band_y, PAGE_W, band_h, fill=1, stroke=0)
         c.setFillColor(_safe_color(data.color_texto4, colors.white))
-        c.setFont("Helvetica-Bold", 30)
-        c.drawCentredString(PAGE_W / 2, band_y + 4 * mm, data.texto4.upper() or "REBAJADO")
+        c.setFont("Helvetica-Bold", max(24, 30 * layout["scale"]))
+        c.drawCentredString(PAGE_W / 2, band_y + 3.6 * mm * layout["scale"], data.texto4.upper() or "REBAJADO")
 
     # Icon row
-    icon_row_y = grid_top - grid_h - 12 * mm
+    icon_row_y = grid_top - grid_h - layout["grid_to_icons_gap"]
     c.setStrokeColor(_safe_color(data.color_borde_caracteristicas, colors.black))
     c.setLineWidth(1)
     if data.borde_caracteristicas == "dashed":
@@ -329,7 +470,7 @@ def generate_pdf(data: FlyerData, output_path: Union[str, BinaryIO]) -> None:
         c.setDash(2, 2)
     else:
         c.setDash()
-    icon_row_h = 14 * mm
+    icon_row_h = layout["icon_row_h"]
     c.setFillColor(colors.white)
     c.rect(10 * mm, icon_row_y, PAGE_W - 20 * mm, icon_row_h, fill=1, stroke=1)
     c.setDash()
@@ -345,20 +486,20 @@ def generate_pdf(data: FlyerData, output_path: Union[str, BinaryIO]) -> None:
     step = (PAGE_W - 20 * mm) / len(icons)
     for i, (label, value, icon_path, value_color) in enumerate(icons):
         cx = 10 * mm + step * (i + 0.5)
-        icon_w = 9 * mm
-        icon_h = 7 * mm
+        icon_w = 9 * mm * layout["scale"]
+        icon_h = 7 * mm * layout["scale"]
         icon_x = cx - icon_w / 2 - 4 * mm
         icon_y = icon_row_y + (icon_row_h - icon_h) / 2
         _draw_feature_icon(c, icon_path, icon_x, icon_y, icon_w, icon_h)
         c.setFillColor(value_color)
-        c.setFont("Helvetica-Bold", 11)
+        c.setFont("Helvetica-Bold", max(9, 11 * layout["scale"]))
         text_x = cx + 4 * mm
-        text_y = icon_row_y + icon_row_h / 2 - 3
+        text_y = icon_row_y + icon_row_h / 2 - 2.5 * layout["scale"]
         c.drawString(text_x, text_y, value)
 
     # QR + description
-    desc_top = icon_row_y - 10 * mm
-    qr_size = 30 * mm
+    desc_top = icon_row_y - layout["icons_to_desc_gap"]
+    qr_size = layout["qr_size"]
     qr_x = 10 * mm
     qr_y = desc_top - qr_size
     c.setFillColor(colors.HexColor("#f1f1f1"))
@@ -366,26 +507,15 @@ def generate_pdf(data: FlyerData, output_path: Union[str, BinaryIO]) -> None:
     if data.qr_imagen:
         _draw_image_fit(c, data.qr_imagen, qr_x, qr_y, qr_size, qr_size)
 
-    desc_x = qr_x + qr_size + 6 * mm
-    desc_w = PAGE_W - desc_x - 10 * mm
-    desc_h = qr_size
-    footer_top = 18 * mm
-    footer_max_h = 18 * mm
-    price_y = footer_top - 2 * mm
-    desc_start_y = qr_y + desc_h - 2 * mm
-    desc_max_h = max(0, desc_start_y - (price_y + 12 * mm))
+    desc_x = layout["desc_x"]
+    desc_w = layout["desc_w"]
+    desc_start_y = desc_top - 2 * mm
+    desc_max_h = max(0, layout["desc_row_h"] - 2 * mm)
     c.setFillColor(_safe_color(data.color_descripcion, colors.black))
-    desc_font_size = 9 if len(data.descripcion or "") <= 1000 else 8
-    line_h = 4.2 * mm if desc_font_size == 9 else 3.8 * mm
-    c.setFont("Helvetica", desc_font_size)
-    _draw_wrapped_text(c, data.descripcion, desc_x, desc_start_y, desc_w, line_h, desc_max_h)
+    c.setFont("Helvetica", layout["desc_font_size"])
+    _draw_wrapped_lines(c, layout["desc_lines"], desc_x, desc_start_y, layout["line_h"], desc_max_h)
 
     # Energy rating + price
-    energy_x = 10 * mm
-    energy_img_w = 30 * mm
-    energy_img_h = 30 * mm
-
-    energy_img_y = price_y + 10 * mm
     _draw_energy_image(c, energy_x, energy_img_y, energy_img_w, energy_img_h, data.energia)
 
     c.setFont("Helvetica-Bold", 10)
@@ -415,23 +545,119 @@ def _draw_wrapped_text(
 ) -> None:
     if not text:
         return
-    wrapped_lines = textwrap.wrap(
-        text,
-        width=87,
-        break_long_words=True,
-        break_on_hyphens=False,
-        replace_whitespace=False,
-        drop_whitespace=False,
-    )
+    font_name = c._fontname
+    font_size = c._fontsize
+    lines = _wrap_text_to_width(c, text, font_name, font_size, w)
+    _draw_wrapped_lines(c, lines, x, y, line_h, max_h)
+
+
+def _draw_wrapped_lines(
+    c: canvas.Canvas,
+    lines: list[str],
+    x: float,
+    y: float,
+    line_h: float,
+    max_h: float,
+) -> None:
+    if not lines:
+        return
     curr_y = y
     max_lines = max(1, int(max_h // line_h))
-    lines_used = 0
-    for line in wrapped_lines:
+    for index, line in enumerate(lines):
+        if index >= max_lines:
+            break
         c.drawString(x, curr_y, line)
         curr_y -= line_h
-        lines_used += 1
-        if lines_used >= max_lines:
-            return
+
+
+def _measure_wrapped_text_height(
+    c: canvas.Canvas,
+    text: str,
+    font_name: str,
+    font_size: float,
+    max_width: float,
+    line_height: float,
+) -> float:
+    lines = _wrap_text_to_width(c, text, font_name, font_size, max_width)
+    return len(lines) * line_height
+
+
+def _wrap_text_to_width(
+    c: canvas.Canvas,
+    text: str,
+    font_name: str,
+    font_size: float,
+    max_width: float,
+) -> list[str]:
+    if not text:
+        return []
+
+    def split_long_word(word: str) -> list[str]:
+        chunks: list[str] = []
+        current = ""
+        for char in word:
+            probe = current + char
+            if c.stringWidth(probe, font_name, font_size) <= max_width or not current:
+                current = probe
+            else:
+                chunks.append(current)
+                current = char
+        if current:
+            chunks.append(current)
+        return chunks
+
+    lines: list[str] = []
+    paragraphs = str(text).replace("\r", "").split("\n")
+    for paragraph in paragraphs:
+        words = paragraph.split()
+        if not words:
+            lines.append("")
+            continue
+        current = ""
+        for word in words:
+            probe = word if not current else f"{current} {word}"
+            if c.stringWidth(probe, font_name, font_size) <= max_width:
+                current = probe
+                continue
+
+            if current:
+                lines.append(current)
+                current = ""
+
+            if c.stringWidth(word, font_name, font_size) <= max_width:
+                current = word
+            else:
+                chunks = split_long_word(word)
+                if chunks:
+                    lines.extend(chunks[:-1])
+                    current = chunks[-1]
+
+        if current:
+            lines.append(current)
+
+    return lines
+
+
+def _truncate_lines_to_count(
+    c: canvas.Canvas,
+    lines: list[str],
+    max_lines: int,
+    font_name: str,
+    font_size: float,
+    max_width: float,
+) -> list[str]:
+    if max_lines <= 0:
+        return []
+    if len(lines) <= max_lines:
+        return lines
+
+    clipped = lines[:max_lines]
+    last = clipped[-1].rstrip()
+    ellipsis = "…"
+    while last and c.stringWidth(f"{last}{ellipsis}", font_name, font_size) > max_width:
+        last = last[:-1]
+    clipped[-1] = f"{last}{ellipsis}" if last else ellipsis
+    return clipped
 
 
 def _draw_energy_label(c: canvas.Canvas, x: float, y: float, w: float, h: float, energia: str) -> None:
@@ -531,6 +757,14 @@ def _safe_dimension_percent(value: float) -> float:
     except Exception:
         return 100.0
     return max(1.0, min(200.0, numeric))
+
+
+def _safe_description_font_size(value: float) -> float:
+    try:
+        numeric = float(value)
+    except Exception:
+        return 9.0
+    return max(8.0, min(14.0, numeric))
 
 
 def _format_superscripts(value: str) -> str:

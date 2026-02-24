@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 import fitz
 from fastapi.staticfiles import StaticFiles
+from PIL import UnidentifiedImageError
 
 from pdf_generator import FlyerData, generate_pdf
 
@@ -111,6 +112,16 @@ def parse_dimension_percent(value: Optional[str], default: float = 100.0) -> flo
     return max(1.0, min(200.0, numeric))
 
 
+def parse_description_font_size(value: Optional[str], default: float = 9.0) -> float:
+    if value is None:
+        return default
+    try:
+        numeric = float(value)
+    except Exception:
+        return default
+    return max(8.0, min(14.0, numeric))
+
+
 @app.post("/api/login")
 async def login(username: str = Form(...), password: str = Form(...)):
     creds = load_credentials()
@@ -142,6 +153,7 @@ async def create_pdf(
     color_borde_caracteristicas: str = Form("#111111"),
     descripcion: str = Form(""),
     color_descripcion: str = Form("#000000"),
+    descripcion_tamano: str = Form("9"),
     precio: str = Form(""),
     color_precio: str = Form("#b9cdb8"),
     energia: str = Form("E"),
@@ -221,6 +233,7 @@ async def create_pdf(
         color_borde_caracteristicas=color_borde_caracteristicas,
         descripcion=descripcion,
         color_descripcion=color_descripcion,
+        descripcion_tamano=parse_description_font_size(descripcion_tamano),
         precio=precio,
         color_precio=color_precio,
         energia=energia,
@@ -257,7 +270,13 @@ async def create_pdf(
     )
 
     pdf_buffer = io.BytesIO()
-    generate_pdf(data, pdf_buffer)
+    try:
+        generate_pdf(data, pdf_buffer)
+    except UnidentifiedImageError:
+        raise HTTPException(status_code=400, detail="Alguna imagen no es válida o está dañada. Usa JPG, PNG o WEBP.")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Error interno al generar el PDF: {exc}")
+
     pdf_buffer.seek(0)
     return Response(content=pdf_buffer.getvalue(), media_type="application/pdf", headers={"Content-Disposition": "attachment; filename=flyer.pdf"})
 
@@ -285,6 +304,7 @@ async def create_preview(
     color_borde_caracteristicas: str = Form("#111111"),
     descripcion: str = Form(""),
     color_descripcion: str = Form("#000000"),
+    descripcion_tamano: str = Form("9"),
     precio: str = Form(""),
     color_precio: str = Form("#b9cdb8"),
     energia: str = Form("E"),
@@ -355,6 +375,7 @@ async def create_preview(
                     "color_borde_caracteristicas": color_borde_caracteristicas,
                     "descripcion": descripcion,
                     "color_descripcion": color_descripcion,
+                    "descripcion_tamano": parse_description_font_size(descripcion_tamano),
                     "precio": precio,
                     "color_precio": color_precio,
                     "energia": energia,
@@ -434,6 +455,7 @@ async def create_preview(
         color_borde_caracteristicas=color_borde_caracteristicas,
         descripcion=descripcion,
         color_descripcion=color_descripcion,
+        descripcion_tamano=parse_description_font_size(descripcion_tamano),
         precio=precio,
         color_precio=color_precio,
         energia=energia,

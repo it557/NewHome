@@ -19,6 +19,7 @@ const DEFAULT_STATE = {
   color_borde_caracteristicas: '#111111',
   descripcion: '',
   color_descripcion: '#000000',
+  descripcion_tamano: 9,
   precio: '154.900€',
   color_precio: '#b9cdb8',
   energia: 'E',
@@ -50,6 +51,14 @@ const DEFAULT_STATE = {
 };
 
 const DESCRIPCION_MAX = 1500;
+const ALLOWED_IMAGE_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+const ALLOWED_IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.webp'];
+const MAX_IMAGE_SIZE_MB = 80;
+const MAX_IMAGE_SIZE_BYTES = MAX_IMAGE_SIZE_MB * 1024 * 1024;
+const A4_WIDTH_PT = 595.2755905512;
+const A4_HEIGHT_PT = 841.8897637795;
+const MM_TO_PT = 2.8346456693;
+const mmToPt = (mm) => mm * MM_TO_PT;
 const LEGAL_TEXT =
   'En cumplimiento del decreto de la Junta de Andalucía 218/2005 del 11 de octubre, se informa al cliente que los gastos notariales, registrales, ITP y otros gastos inherentes a la compraventa no están incluidos en la venta.';
 
@@ -96,6 +105,137 @@ const clampOffset = (value) => {
   return Math.min(100, Math.max(-100, numeric));
 };
 
+const clampDescriptionFontSize = (value) => {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return DEFAULT_STATE.descripcion_tamano;
+  }
+  return Math.min(14, Math.max(8, numeric));
+};
+
+const getFileExtension = (name = '') => {
+  const dot = name.lastIndexOf('.');
+  return dot >= 0 ? name.slice(dot).toLowerCase() : '';
+};
+
+const isSupportedImageFile = (file) => {
+  if (!file) {
+    return true;
+  }
+  const mimeType = (file.type || '').toLowerCase();
+  const extension = getFileExtension(file.name || '');
+  return ALLOWED_IMAGE_MIME_TYPES.includes(mimeType) || ALLOWED_IMAGE_EXTENSIONS.includes(extension);
+};
+
+const parseApiError = async (response) => {
+  if (response.status === 413) {
+    return `Archivo demasiado grande. Reduce el peso de la imagen (máx. recomendado ${MAX_IMAGE_SIZE_MB} MB por imagen).`;
+  }
+
+  const contentType = response.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) {
+    try {
+      const payload = await response.json();
+      if (typeof payload?.detail === 'string' && payload.detail.trim()) {
+        return payload.detail;
+      }
+      if (Array.isArray(payload?.detail) && payload.detail.length) {
+        return payload.detail
+          .map((entry) => {
+            const loc = Array.isArray(entry?.loc) ? entry.loc.join('.') : '';
+            return `${loc}: ${entry?.msg || 'valor inválido'}`;
+          })
+          .join('\n');
+      }
+    } catch {
+      // ignore JSON parsing errors and fallback below
+    }
+  }
+
+  try {
+    const text = await response.text();
+    if (text && text.trim()) {
+      return text.trim();
+    }
+  } catch {
+    // ignore text parsing errors and fallback below
+  }
+
+  return `Error ${response.status} al generar el PDF`;
+};
+
+let textMeasureContext;
+
+const getTextMeasureContext = () => {
+  if (!textMeasureContext) {
+    const canvas = document.createElement('canvas');
+    textMeasureContext = canvas.getContext('2d');
+  }
+  return textMeasureContext;
+};
+
+const wrapTextToWidth = (text, fontSizePx, maxWidthPx) => {
+  const input = normalizeText(text || '');
+  if (!input || maxWidthPx <= 0) {
+    return [];
+  }
+  const ctx = getTextMeasureContext();
+  if (!ctx) {
+    return [input];
+  }
+  ctx.font = `${fontSizePx}px "Segoe UI", system-ui, sans-serif`;
+
+  const splitLongWord = (word) => {
+    const chunks = [];
+    let current = '';
+    for (const char of word) {
+      const probe = current + char;
+      if (ctx.measureText(probe).width <= maxWidthPx || !current) {
+        current = probe;
+      } else {
+        chunks.push(current);
+        current = char;
+      }
+    }
+    if (current) {
+      chunks.push(current);
+    }
+    return chunks;
+  };
+
+  const lines = [];
+  const words = input.split(/\s+/);
+  let currentLine = '';
+  for (const word of words) {
+    const candidate = currentLine ? `${currentLine} ${word}` : word;
+    if (ctx.measureText(candidate).width <= maxWidthPx) {
+      currentLine = candidate;
+      continue;
+    }
+
+    if (currentLine) {
+      lines.push(currentLine);
+      currentLine = '';
+    }
+
+    if (ctx.measureText(word).width <= maxWidthPx) {
+      currentLine = word;
+    } else {
+      const chunks = splitLongWord(word);
+      lines.push(...chunks.slice(0, -1));
+      currentLine = chunks[chunks.length - 1] || '';
+    }
+  }
+
+  if (currentLine) {
+    lines.push(currentLine);
+  }
+
+  return lines;
+};
+
+const clampLayoutScale = (value) => Math.min(1.08, Math.max(0.9, value));
+
 const getImageAdjustments = (state, imageKey) => {
   const baseScale = clampScale(state.escala_imagenes);
   const individualScale = clampScale(state[`${imageKey}_escala`]);
@@ -125,13 +265,16 @@ const Field = ({ label, children, full = false }) => (
   </label>
 );
 
-const ColorField = ({ label, value, onChange, onBlur }) => (
+const ColorField = ({ label, value, onChange, onBlur, children }) => (
   <label className="field">
     <span className="field-label">{label}</span>
-    <span className="color-field">
-      <span className="palette">🎨</span>
-      <input type="color" value={value} onChange={onChange} onBlur={onBlur} />
-      <span className="color-value">{value}</span>
+    <span className="color-field-group">
+      <span className="color-field">
+        <span className="palette">🎨</span>
+        <input type="color" value={value} onChange={onChange} onBlur={onBlur} />
+        <span className="color-value">{value.toUpperCase()}</span>
+      </span>
+      {children}
     </span>
   </label>
 );
@@ -225,6 +368,8 @@ export default function App() {
     habitaciones: '',
     banos: ''
   });
+  const previewSheetRef = useRef(null);
+  const [previewSize, setPreviewSize] = useState({ width: 0, height: 0 });
 
   useEffect(() => {
     const timer = setTimeout(() => setShowSplash(false), 1400);
@@ -324,6 +469,23 @@ export default function App() {
     localStorage.setItem('newhome-form', JSON.stringify(form));
   }, [form]);
 
+  useEffect(() => {
+    const element = previewSheetRef.current;
+    if (!element) {
+      return;
+    }
+
+    const updateSize = () => {
+      const rect = element.getBoundingClientRect();
+      setPreviewSize({ width: rect.width, height: rect.height });
+    };
+
+    updateSize();
+    const resizeObserver = new ResizeObserver(updateSize);
+    resizeObserver.observe(element);
+    return () => resizeObserver.disconnect();
+  }, []);
+
   const logoUrl = useMemo(() => '/static/logo_new_home.png', []);
   const xfuegoUrl = useMemo(() => '/static/XFuego.png', []);
 
@@ -347,6 +509,10 @@ export default function App() {
       setForm((prev) => ({ ...prev, escala_imagenes: clampScale(value) }));
       return;
     }
+    if (field === 'descripcion_tamano') {
+      setForm((prev) => ({ ...prev, descripcion_tamano: clampDescriptionFontSize(value) }));
+      return;
+    }
     if (field.endsWith('_escala')) {
       setForm((prev) => ({ ...prev, [field]: clampScale(value) }));
       return;
@@ -368,6 +534,18 @@ export default function App() {
 
   const handleFile = (field) => (event) => {
     const file = event.target.files?.[0] || null;
+    if (file && !isSupportedImageFile(file)) {
+      alert('Formato no compatible. Usa JPG, PNG o WEBP.');
+      event.target.value = '';
+      setFiles((prev) => ({ ...prev, [field]: null }));
+      return;
+    }
+    if (file && file.size > MAX_IMAGE_SIZE_BYTES) {
+      alert(`La imagen supera ${MAX_IMAGE_SIZE_MB} MB. Comprime o reduce la resolución.`);
+      event.target.value = '';
+      setFiles((prev) => ({ ...prev, [field]: null }));
+      return;
+    }
     setFiles((prev) => ({ ...prev, [field]: file }));
   };
 
@@ -390,9 +568,14 @@ export default function App() {
   const handleGenerate = async () => {
     setLoading(true);
     try {
+      if (!Number.isFinite(Number(form.habitaciones)) || !Number.isFinite(Number(form.banos))) {
+        throw new Error('Habitaciones y baños deben ser números válidos.');
+      }
+
       const response = await fetch('/api/pdf', { method: 'POST', body: buildPayload() });
       if (!response.ok) {
-        throw new Error('No se pudo generar el PDF');
+        const apiError = await parseApiError(response);
+        throw new Error(`No se pudo generar el PDF: ${apiError}`);
       }
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
@@ -459,14 +642,139 @@ export default function App() {
     E: -2,
     A: -15,
     B: -10,
-    C: 0  
+    C: 0
   };
   const energyX = energyXOffsets[energyLevels[energyIndex]] ?? 0;
   const descriptionText = normalizeText(form.descripcion);
   const isLongDescription = descriptionText.length > 1000;
+  const descriptionFontSize = clampDescriptionFontSize(form.descripcion_tamano);
   const borderStyle = form.borde_caracteristicas || 'solid';
   const borderColor = form.color_borde_caracteristicas || '#111111';
   const borderWidth = borderStyle === 'double' ? '3px' : ['groove', 'ridge', 'inset', 'outset'].includes(borderStyle) ? '2px' : '1px';
+
+  const mainLayout = useMemo(() => {
+    const widthPx = previewSize.width || 707;
+    const heightPx = previewSize.height || 1000;
+
+    const pxFromPtX = (value) => (value / A4_WIDTH_PT) * widthPx;
+    const pxFromPtY = (value) => (value / A4_HEIGHT_PT) * heightPx;
+
+    const topAreaBottomPt = A4_HEIGHT_PT - mmToPt(20) - mmToPt(12);
+    const bottomAreaTopPt = mmToPt(58);
+    const availableHeightPt = topAreaBottomPt - bottomAreaTopPt;
+    const minMarginPt = mmToPt(3);
+
+    const descFontPt = descriptionFontSize;
+    const lineHeightPt = Math.max(mmToPt(3.2), descFontPt * 1.3);
+
+    const solveLayout = (scale, spacingRatio, fontPt = descFontPt) => {
+      const topGapPt = mmToPt(6) * spacingRatio;
+      const gridHeightPt = mmToPt(110) * scale;
+      const gridToIconsPt = mmToPt(12) * spacingRatio;
+      const iconsHeightPt = mmToPt(14) * scale;
+      const iconsToDescPt = mmToPt(10) * spacingRatio;
+      const qrSizePt = mmToPt(30) * scale;
+      const descXPt = mmToPt(10) + qrSizePt + mmToPt(6);
+      const descWidthPt = A4_WIDTH_PT - descXPt - mmToPt(10);
+      const descWidthPx = pxFromPtX(descWidthPt);
+      const fontPx = pxFromPtY(fontPt);
+      const lines = wrapTextToWidth(descriptionText, fontPx, descWidthPx);
+      const descHeightPt = lines.length * lineHeightPt;
+      const descRowHeightPt = Math.max(qrSizePt, descHeightPt + mmToPt(2));
+      const blockHeightPt =
+        topGapPt +
+        gridHeightPt +
+        gridToIconsPt +
+        iconsHeightPt +
+        iconsToDescPt +
+        descRowHeightPt;
+
+      return {
+        scale,
+        fontPt,
+        topGapPt,
+        gridHeightPt,
+        gridToIconsPt,
+        iconsHeightPt,
+        iconsToDescPt,
+        qrSizePt,
+        descXPt,
+        descWidthPt,
+        lineHeightPt,
+        lines,
+        descRowHeightPt,
+        remainingPt: availableHeightPt - blockHeightPt
+      };
+    };
+
+    let layout = solveLayout(1.0, 1.0);
+    if (layout.remainingPt > mmToPt(20)) {
+      for (let scale = 1.01; scale <= 1.08; scale += 0.01) {
+        const candidate = solveLayout(clampLayoutScale(scale), 1.0);
+        if (candidate.remainingPt >= 2 * minMarginPt) {
+          layout = candidate;
+        }
+      }
+    }
+
+    if (layout.remainingPt < 2 * minMarginPt) {
+      for (let scale = 1.0; scale >= 0.9; scale -= 0.01) {
+        const candidate = solveLayout(clampLayoutScale(scale), 0.88);
+        layout = candidate;
+        if (candidate.remainingPt >= 2 * minMarginPt) {
+          break;
+        }
+      }
+    }
+
+    if (layout.remainingPt < 2 * minMarginPt) {
+      for (let fontPt = descFontPt; fontPt >= 8; fontPt -= 0.5) {
+        const candidate = solveLayout(0.9, 0.82, fontPt);
+        layout = candidate;
+        if (candidate.remainingPt >= 2 * minMarginPt) {
+          break;
+        }
+      }
+    }
+
+    const remainingPt = Math.max(0, layout.remainingPt);
+    const topMarginPt = remainingPt >= 2 * minMarginPt ? remainingPt / 2 : remainingPt / 2;
+    const gridTopPt = topAreaBottomPt - topMarginPt - layout.topGapPt;
+    const mainTopPt = A4_HEIGHT_PT - gridTopPt;
+
+    const maxDescLines = Math.max(1, Math.floor((layout.descRowHeightPt - mmToPt(2)) / layout.lineHeightPt));
+
+    const priceRight = pxFromPtX(mmToPt(12));
+    const priceFontPx = Math.max(32, Math.min(68, heightPx * 0.064));
+    const legalBottom = pxFromPtY(mmToPt(18));
+    const legalHeight = pxFromPtY(mmToPt(18));
+    const priceBottom = legalBottom + legalHeight + pxFromPtY(mmToPt(2));
+
+    return {
+      top: pxFromPtY(mainTopPt),
+      gridHeight: pxFromPtY(layout.gridHeightPt),
+      gridToIcons: pxFromPtY(layout.gridToIconsPt),
+      iconsHeight: pxFromPtY(layout.iconsHeightPt),
+      iconsToDesc: pxFromPtY(layout.iconsToDescPt),
+      qrSize: pxFromPtX(layout.qrSizePt),
+      descLineHeight: pxFromPtY(layout.lineHeightPt),
+      descFontPx: pxFromPtY(layout.fontPt),
+      descX: pxFromPtX(layout.descXPt),
+      descRight: pxFromPtX(mmToPt(10)),
+      maxDescLines,
+      energyLeft: pxFromPtX(mmToPt(10)),
+      energyBottom: pxFromPtY(mmToPt(26)),
+      energySize: pxFromPtX(mmToPt(30)),
+      priceLabelBottom: pxFromPtY(mmToPt(24)),
+      priceBottom,
+      priceRight,
+      priceFontPx,
+      legalBottom,
+      legalHeight,
+      legalLineHeight: pxFromPtY(mmToPt(4.2)),
+      legalRight: pxFromPtX(mmToPt(10))
+    };
+  }, [descriptionFontSize, descriptionText, previewSize.height, previewSize.width]);
 
   if (showSplash) {
     return (
@@ -517,7 +825,7 @@ export default function App() {
       <main className="preview">
         <div className="preview-card">
           <h2>Vista previa</h2>
-          <div className="preview-sheet">
+          <div className="preview-sheet" ref={previewSheetRef}>
             <div className="flyer">
               <header className="flyer-header" style={{ backgroundColor: '#213502' }}>
                 <div className="flyer-title" style={{ color: form.color_texto1 }}>{(form.texto1 || 'TEXTO 1').toUpperCase()}</div>
@@ -529,75 +837,87 @@ export default function App() {
                 <div className="flyer-subtext" style={{ color: form.color_texto3 }}>{formatSuperscripts(form.texto3 || 'TEXTO 3')}</div>
               </div>
 
-              <div className="flyer-grid">
-                {IMAGE_SLOTS.map(({ key, label }) => {
-                  const { mode, scale, offsetX, offsetY, customWidth, customHeight } = getImageAdjustments(form, key);
-                  const fitMode = mode === 'expand' || mode === 'custom' ? 'fill' : mode;
-                  const renderedWidth = mode === 'custom' ? customWidth : 100;
-                  const renderedHeight = mode === 'custom' ? customHeight : 100;
-                  return (
-                    <div
-                      key={key}
-                      className="flyer-cell"
-                      style={{
-                        '--img-fit': fitMode,
-                        '--img-width': `${renderedWidth}%`,
-                        '--img-height': `${renderedHeight}%`,
-                        '--img-scale': String(scale),
-                        '--img-offset-x': `${offsetX / 2}%`,
-                        '--img-offset-y': `${offsetY / 2}%`
-                      }}
-                    >
-                    {previewImages[key] ? (
-                      <img src={previewImages[key]} alt={label} />
-                    ) : (
-                      <span className="flyer-cell-placeholder">{label}</span>
-                    )}
+              <div className="flyer-main" style={{ top: `${mainLayout.top}px` }}>
+                <div className="flyer-grid" style={{ height: `${mainLayout.gridHeight}px` }}>
+                  {IMAGE_SLOTS.map(({ key, label }) => {
+                    const { mode, scale, offsetX, offsetY, customWidth, customHeight } = getImageAdjustments(form, key);
+                    const fitMode = mode === 'expand' || mode === 'custom' ? 'fill' : mode;
+                    const renderedWidth = mode === 'custom' ? customWidth : 100;
+                    const renderedHeight = mode === 'custom' ? customHeight : 100;
+                    return (
+                      <div
+                        key={key}
+                        className="flyer-cell"
+                        style={{
+                          '--img-fit': fitMode,
+                          '--img-width': `${renderedWidth}%`,
+                          '--img-height': `${renderedHeight}%`,
+                          '--img-scale': String(scale),
+                          '--img-offset-x': `${offsetX / 2}%`,
+                          '--img-offset-y': `${offsetY / 2}%`
+                        }}
+                      >
+                      {previewImages[key] ? (
+                        <img src={previewImages[key]} alt={label} />
+                      ) : (
+                        <span className="flyer-cell-placeholder">{label}</span>
+                      )}
+                      </div>
+                    );
+                  })}
+                  {form.rebajado && (
+                    <div className="flyer-band">
+                      <span style={{ color: form.color_texto4 }}>{(form.texto4 || 'REBAJADO').toUpperCase()}</span>
                     </div>
-                  );
-                })}
-                {form.rebajado && (
-                  <div className="flyer-band">
-                    <span style={{ color: form.color_texto4 }}>{(form.texto4 || 'REBAJADO').toUpperCase()}</span>
-                  </div>
-                )}
-              </div>
-
-              <div
-                className="flyer-icons"
-                style={{
-                  borderStyle,
-                  borderColor,
-                  borderWidth
-                }}
-              >
-                <div className="flyer-icon"><img src="/static/dormitorio.png" alt="Habitaciones" /><span>{form.habitaciones}</span></div>
-                <div className="flyer-icon"><img src="/static/aseo.png" alt="Baños" /><span>{form.banos}</span></div>
-                <div className="flyer-icon"><img src="/static/jardin.png" alt="Jardín" /><span className={form.jardin ? 'flag yes' : 'flag no'}>{form.jardin ? '✓' : '✗'}</span></div>
-                <div className="flyer-icon"><img src="/static/garaje.png" alt="Garaje" /><span className={form.garaje ? 'flag yes' : 'flag no'}>{form.garaje ? '✓' : '✗'}</span></div>
-                <div className="flyer-icon"><img src="/static/piscina.png" alt="Piscina" /><span className={form.piscina ? 'flag yes' : 'flag no'}>{form.piscina ? '✓' : '✗'}</span></div>
-              </div>
-
-              <div className="flyer-details">
-                <div className="flyer-qr">
-                  {previewImages.qr_imagen ? <img src={previewImages.qr_imagen} alt="QR" /> : null}
+                  )}
                 </div>
-                <p
-                  className={`flyer-desc-text${isLongDescription ? ' long' : ''}`}
-                  style={{ color: form.color_descripcion }}
+
+                <div
+                  className="flyer-icons"
+                  style={{
+                    marginTop: `${mainLayout.gridToIcons}px`,
+                    minHeight: `${mainLayout.iconsHeight}px`,
+                    borderStyle,
+                    borderColor,
+                    borderWidth
+                  }}
                 >
-                  {descriptionText}
-                </p>
-                <div className="flyer-energy">
-                  <div className="energy-box">
-                    <img src="/static/certificado.png" alt="Energía" />
-                    <span className="energy-arrow" style={{ top: energyTop, transform: `translateX(${energyX}px)` }} />
-                  </div>
+                  <div className="flyer-icon"><img src="/static/dormitorio.png" alt="Habitaciones" /><span>{form.habitaciones}</span></div>
+                  <div className="flyer-icon"><img src="/static/aseo.png" alt="Baños" /><span>{form.banos}</span></div>
+                  <div className="flyer-icon"><img src="/static/jardin.png" alt="Jardín" /><span className={form.jardin ? 'flag yes' : 'flag no'}>{form.jardin ? '✓' : '✗'}</span></div>
+                  <div className="flyer-icon"><img src="/static/garaje.png" alt="Garaje" /><span className={form.garaje ? 'flag yes' : 'flag no'}>{form.garaje ? '✓' : '✗'}</span></div>
+                  <div className="flyer-icon"><img src="/static/piscina.png" alt="Piscina" /><span className={form.piscina ? 'flag yes' : 'flag no'}>{form.piscina ? '✓' : '✗'}</span></div>
                 </div>
-                <div className="flyer-price-label">Precio</div>
-                <div className="flyer-price" style={{ color: form.color_precio }}>{form.precio || '0€'}</div>
-                <p className="flyer-desc2">{LEGAL_TEXT}</p>
+
+                <div className="flyer-desc-row" style={{ marginTop: `${mainLayout.iconsToDesc}px`, minHeight: `${mainLayout.descRowHeight}px` }}>
+                  <div className="flyer-qr" style={{ width: `${mainLayout.qrSize}px`, height: `${mainLayout.qrSize}px` }}>
+                    {previewImages.qr_imagen ? <img src={previewImages.qr_imagen} alt="QR" /> : null}
+                  </div>
+                  <p
+                    className={`flyer-desc-text${isLongDescription ? ' long' : ''}`}
+                    style={{
+                      color: form.color_descripcion,
+                      fontSize: `${mainLayout.descFontPx}px`,
+                      lineHeight: `${mainLayout.descLineHeight}px`,
+                      left: `${mainLayout.descX}px`,
+                      right: `${mainLayout.descRight}px`,
+                      maxHeight: `${mainLayout.descLineHeight * mainLayout.maxDescLines}px`
+                    }}
+                  >
+                    {descriptionText}
+                  </p>
+                </div>
               </div>
+
+              <div className="flyer-energy" style={{ left: `${mainLayout.energyLeft}px`, bottom: `${mainLayout.energyBottom}px`, width: `${mainLayout.energySize}px` }}>
+                <div className="energy-box">
+                  <img src="/static/certificado.png" alt="Energía" />
+                  <span className="energy-arrow" style={{ top: energyTop, transform: `translateX(${energyX}px)` }} />
+                </div>
+              </div>
+              <div className="flyer-price-label" style={{ left: `${mainLayout.energyLeft}px`, width: `${mainLayout.energySize}px`, bottom: `${mainLayout.priceLabelBottom}px` }}>Precio</div>
+              <div className="flyer-price" style={{ color: form.color_precio, right: `${mainLayout.priceRight}px`, bottom: `${mainLayout.priceBottom}px`, fontSize: `${mainLayout.priceFontPx}px` }}>{form.precio || '0€'}</div>
+              <p className="flyer-desc2" style={{ left: `${mainLayout.descX}px`, right: `${mainLayout.legalRight}px`, bottom: `${mainLayout.legalBottom}px`, height: `${mainLayout.legalHeight}px`, lineHeight: `${mainLayout.legalLineHeight}px`, overflow: 'hidden' }}>{LEGAL_TEXT}</p>
             </div>
           </div>
         </div>
@@ -658,7 +978,30 @@ export default function App() {
               {countWords(descDraft)} palabras · {descDraft.length}/{DESCRIPCION_MAX} caracteres
             </span>
           </Field>
-          <ColorField label="Color descripción" value={form.color_descripcion} onChange={handleChange('color_descripcion')} />
+          <ColorField label="Color descripción" value={form.color_descripcion} onChange={handleChange('color_descripcion')}>
+            <span className="description-size">
+              <span className="description-size-label">Tamaño</span>
+              <span className="description-size-control">
+                <input
+                  type="number"
+                  min="8"
+                  max="14"
+                  step="1"
+                  value={descriptionFontSize}
+                  onChange={handleChange('descripcion_tamano')}
+                  onWheel={(event) => {
+                    event.preventDefault();
+                    const delta = event.deltaY < 0 ? 1 : -1;
+                    setForm((prev) => ({
+                      ...prev,
+                      descripcion_tamano: clampDescriptionFontSize(Number(prev.descripcion_tamano) + delta)
+                    }));
+                  }}
+                />
+                <span>{descriptionFontSize}px</span>
+              </span>
+            </span>
+          </ColorField>
         </section>
 
         <section className="section-grid">
